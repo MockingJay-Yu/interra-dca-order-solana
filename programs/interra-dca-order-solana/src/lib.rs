@@ -11,6 +11,8 @@ declare_id!("GXjKcJ6RHuBuKMRe8SDtqosckaiVcGradnv9yYByR8TG");
 
 #[program]
 pub mod interra_dca_order_solana {
+    use anchor_lang::context;
+
     use super::*;
 
     pub fn initialize(ctx: Context<Initialize>, platform_fee: u16, treasury: Pubkey) -> Result<()> {
@@ -104,6 +106,10 @@ pub mod interra_dca_order_solana {
     }
 
     pub fn open_order_spl(ctx: Context<OpenOrderSpl>, params: OpenOrderParams) -> Result<()> {
+        require!(
+            !ctx.accounts.global_config.paused,
+            CustomError::ProgramPaused
+        );
         if params.from_token == native_token()
             || params.from_chain_id != 10002
             || params.amount_in == 0
@@ -115,10 +121,6 @@ pub mod interra_dca_order_solana {
             || params.amount_out_min == [0u8; 32]
             || params.amount_out_max == [0u8; 32]
         {
-            return Err(error!(CustomError::InvalidParameter));
-        }
-        let clock = Clock::get()?;
-        if params.time_stamp <= clock.unix_timestamp {
             return Err(error!(CustomError::InvalidParameter));
         }
         require_keys_eq!(
@@ -149,6 +151,300 @@ pub mod interra_dca_order_solana {
         emit!(OrderOpened {
             order_pubkey: ctx.accounts.order.key(),
         });
+        Ok(())
+    }
+
+    pub fn cancel_order_sol(ctx: Context<CancelOrderSol>) -> Result<()> {
+        require!(
+            ctx.accounts.global_config.paused == false,
+            CustomError::ProgramPaused
+        );
+
+        let order = &ctx.accounts.order;
+        require!(
+            order.from_token == native_token(),
+            CustomError::InvalidParameter
+        );
+        require!(
+            ctx.accounts.user.key() == order.sender
+                || ctx.accounts.user.key() == ctx.accounts.global_config.owner,
+            CustomError::OnlySenderOrOwner
+        );
+
+        require!(
+            ctx.accounts.refund_receiver.key() == order.sender,
+            CustomError::InvalidRefundReceiver
+        );
+        **ctx
+            .accounts
+            .order
+            .to_account_info()
+            .try_borrow_mut_lamports()? -= order.remaining_amount;
+        **ctx
+            .accounts
+            .refund_receiver
+            .to_account_info()
+            .try_borrow_mut_lamports()? += order.remaining_amount;
+
+        emit!(OrderCancelled {
+            order_pubkey: ctx.accounts.order.key(),
+            by: ctx.accounts.user.key(),
+        });
+
+        Ok(())
+    }
+
+    pub fn cancel_order_spl(ctx: Context<CancelOrderSpl>) -> Result<()> {
+        require!(
+            ctx.accounts.global_config.paused == false,
+            CustomError::ProgramPaused
+        );
+
+        let order = &ctx.accounts.order;
+        require!(
+            order.from_token != native_token(),
+            CustomError::InvalidParameter
+        );
+
+        require!(
+            ctx.accounts.user.key() == order.sender
+                || ctx.accounts.user.key() == ctx.accounts.global_config.owner,
+            CustomError::OnlySenderOrOwner
+        );
+
+        require!(
+            ctx.accounts.refund_receiver.key() == order.sender,
+            CustomError::InvalidRefundReceiver
+        );
+
+        // PDA 签名 seeds
+        let seeds = &[
+            b"dca_order",
+            order.sender.as_ref(),
+            &order.time_stamp.to_le_bytes(),
+            &[order.bump],
+        ];
+        let signer = &[&seeds[..]];
+
+        // SPL Token Transfer（从 PDA 转 token 到用户）
+        let cpi_accounts = TokenTransfer {
+            from: ctx.accounts.order_token_account.to_account_info(),
+            to: ctx.accounts.user_token_account.to_account_info(),
+            authority: ctx.accounts.order.to_account_info(), // PDA 授权
+        };
+        let cpi_ctx = CpiContext::new_with_signer(
+            ctx.accounts.token_program.to_account_info(),
+            cpi_accounts,
+            signer,
+        );
+        token::transfer(cpi_ctx, order.remaining_amount)?;
+
+        let close_cpi_accounts = CloseAccount {
+            account: ctx.accounts.order_token_account.to_account_info(),
+            destination: ctx.accounts.refund_receiver.to_account_info(),
+            authority: ctx.accounts.order.to_account_info(),
+        };
+
+        let close_cpi_ctx = CpiContext::new_with_signer(
+            ctx.accounts.token_program.to_account_info(),
+            close_cpi_accounts,
+            signer,
+        );
+
+        token::close_account(close_cpi_ctx)?;
+
+        emit!(OrderCancelled {
+            order_pubkey: ctx.accounts.order.key(),
+            by: ctx.accounts.user.key(),
+        });
+
+        Ok(())
+    }
+
+    pub fn execute_order_sol(
+        ctx: Context<ExecuteOrderSol>,
+        execute_amount: u64,
+        native_token_volume: u64,
+    ) -> Result<()> {
+        let config = &ctx.accounts.global_config;
+
+        require!(
+            ctx.accounts.global_config.paused == false,
+            CustomError::ProgramPaused
+        );
+
+        require!(
+            ctx.accounts.order.from_token != native_token(),
+            CustomError::InvalidParameter
+        );
+
+        require!(
+            ctx.accounts.order.remaining_amount < execute_amount,
+            CustomError::InvalidParameter
+        );
+
+        require_keys_eq!(
+            ctx.accounts.executor.key(),
+            ctx.accounts.global_config.owner,
+            CustomError::OnlyOwnerCanExecute
+        );
+
+        require_keys_eq!(
+            ctx.accounts.refund_receiver.key(),
+            ctx.accounts.order.sender,
+            CustomError::InvalidRefundReceiver
+        );
+
+        let platform_fee = config.platform_fee;
+
+        let fee_amount = execute_amount
+            .checked_mul(platform_fee as u64)
+            .ok_or(CustomError::Overflow)?
+            / 10000;
+        let send_amount = execute_amount
+            .checked_sub(fee_amount)
+            .ok_or(CustomError::Overflow)?;
+        require!(send_amount > 0, CustomError::InsufficientFunds);
+
+        **ctx
+            .accounts
+            .order
+            .to_account_info()
+            .try_borrow_mut_lamports()? -= execute_amount;
+        **ctx.accounts.target_sol.try_borrow_mut_lamports()? += send_amount;
+        **ctx.accounts.treasury.try_borrow_mut_lamports()? += fee_amount;
+
+        emit!(OrderExecuted {
+            order_pubkey: ctx.accounts.order.key(),
+            by: ctx.accounts.executor.key(),
+            native_token_volume,
+        });
+
+        if ctx.accounts.order.remaining_amount == execute_amount
+            || ctx.accounts.order.remaining_amount == 1
+        {
+            ctx.accounts
+                .order
+                .close(ctx.accounts.refund_receiver.to_account_info())?;
+        } else {
+            ctx.accounts.order.remaining_amount -= execute_amount;
+            ctx.accounts.order.remaining_execute_count -= 1;
+        }
+
+        Ok(())
+    }
+
+    pub fn execute_order_spl(
+        ctx: Context<ExecuteOrderSpl>,
+        execute_amount: u64,
+        native_token_volume: u64,
+    ) -> Result<()> {
+        let config = &ctx.accounts.global_config;
+        let order = &ctx.accounts.order;
+
+        require!(
+            ctx.accounts.global_config.paused == false,
+            CustomError::ProgramPaused
+        );
+
+        require!(
+            ctx.accounts.order.from_token != native_token(),
+            CustomError::InvalidParameter
+        );
+
+        require!(
+            ctx.accounts.order.remaining_amount < execute_amount,
+            CustomError::InvalidParameter
+        );
+
+        require_keys_eq!(
+            ctx.accounts.executor.key(),
+            ctx.accounts.global_config.owner,
+            CustomError::OnlyOwnerCanExecute
+        );
+
+        require_keys_eq!(
+            ctx.accounts.refund_receiver.key(),
+            ctx.accounts.order.sender,
+            CustomError::InvalidRefundReceiver
+        );
+
+        let amount_in = order.amount_in;
+        let platform_fee = config.platform_fee;
+
+        let fee_amount = amount_in
+            .checked_mul(platform_fee as u64)
+            .ok_or(CustomError::Overflow)?
+            / 10000;
+        let send_amount = amount_in
+            .checked_sub(fee_amount)
+            .ok_or(CustomError::Overflow)?;
+        require!(send_amount > 0, CustomError::InsufficientFunds);
+
+        // PDA 签名 seeds
+        let seeds = &[
+            b"limit_order",
+            order.sender.as_ref(),
+            &order.time_stamp.to_le_bytes(),
+            &[order.bump],
+        ];
+        let signer = &[&seeds[..]];
+
+        // SPL Token Transfer（从 PDA 转 token 到用户）
+        let cpi_accounts = TokenTransfer {
+            from: ctx.accounts.order_token_account.to_account_info(),
+            to: ctx.accounts.target_token_account.to_account_info(),
+            authority: ctx.accounts.order.to_account_info(), // PDA 授权
+        };
+        let cpi_ctx = CpiContext::new_with_signer(
+            ctx.accounts.token_program.to_account_info(),
+            cpi_accounts,
+            signer,
+        );
+        token::transfer(cpi_ctx, send_amount)?;
+
+        // SPL Token Transfer（从 PDA 转 token 到用户）
+        let cpi_accounts = TokenTransfer {
+            from: ctx.accounts.order_token_account.to_account_info(),
+            to: ctx.accounts.treasury_token_account.to_account_info(),
+            authority: ctx.accounts.order.to_account_info(), // PDA 授权
+        };
+        let cpi_ctx = CpiContext::new_with_signer(
+            ctx.accounts.token_program.to_account_info(),
+            cpi_accounts,
+            signer,
+        );
+        token::transfer(cpi_ctx, fee_amount)?;
+
+        let close_cpi_accounts = CloseAccount {
+            account: ctx.accounts.order_token_account.to_account_info(),
+            destination: ctx.accounts.refund_receiver.to_account_info(),
+            authority: ctx.accounts.order.to_account_info(),
+        };
+        let close_cpi_ctx = CpiContext::new_with_signer(
+            ctx.accounts.token_program.to_account_info(),
+            close_cpi_accounts,
+            signer,
+        );
+        token::close_account(close_cpi_ctx)?;
+
+        emit!(OrderExecuted {
+            order_pubkey: ctx.accounts.order.key(),
+            by: ctx.accounts.executor.key(),
+            native_token_volume,
+        });
+
+        if ctx.accounts.order.remaining_amount == execute_amount
+            || ctx.accounts.order.remaining_amount == 1
+        {
+            ctx.accounts
+                .order
+                .close(ctx.accounts.refund_receiver.to_account_info())?;
+        } else {
+            ctx.accounts.order.remaining_amount -= execute_amount;
+            ctx.accounts.order.remaining_execute_count -= 1;
+        }
+
         Ok(())
     }
 }
@@ -252,6 +548,8 @@ pub struct OpenOrderSpl<'info> {
     )]
     pub order_token_account: Account<'info, TokenAccount>,
 
+    #[account(seeds = [b"global-config"], bump)]
+    pub global_config: Account<'info, GlobalConfig>,
     pub token_mint: Account<'info, Mint>,
 
     pub token_program: Program<'info, Token>,
@@ -259,6 +557,125 @@ pub struct OpenOrderSpl<'info> {
     pub system_program: Program<'info, System>,
 
     pub associated_token_program: Program<'info, anchor_spl::associated_token::AssociatedToken>,
+}
+
+#[derive(Accounts)]
+pub struct CancelOrderSol<'info> {
+    #[account(
+        mut,
+        close = refund_receiver
+    )]
+    pub order: Account<'info, DCAOrder>,
+
+    #[account(mut)]
+    pub user: Signer<'info>,
+
+    #[account(mut)]
+    pub refund_receiver: SystemAccount<'info>,
+
+    #[account(
+        seeds = [b"global-config"],
+        bump,
+    )]
+    pub global_config: Account<'info, GlobalConfig>,
+
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+pub struct CancelOrderSpl<'info> {
+    #[account(
+        mut,
+        seeds = [b"dca_order", order.sender.as_ref(), &order.time_stamp.to_le_bytes()],
+        bump = order.bump,
+        close = refund_receiver
+    )]
+    pub order: Account<'info, DCAOrder>,
+
+    #[account(mut)]
+    pub user: Signer<'info>,
+
+    #[account(
+        mut,
+        constraint = user_token_account.owner == refund_receiver.key(),
+        constraint = user_token_account.mint == order.from_token
+    )]
+    pub user_token_account: Account<'info, TokenAccount>,
+
+    #[account(
+        mut,
+        constraint = order_token_account.owner == order.key(),
+    )]
+    pub order_token_account: Account<'info, TokenAccount>,
+
+    #[account(mut)]
+    pub refund_receiver: SystemAccount<'info>,
+
+    #[account(
+        seeds = [b"global-config"],
+        bump
+    )]
+    pub global_config: Account<'info, GlobalConfig>,
+
+    pub token_program: Program<'info, Token>,
+}
+
+#[derive(Accounts)]
+pub struct ExecuteOrderSol<'info> {
+    #[account(mut)]
+    pub order: Account<'info, DCAOrder>,
+
+    #[account(mut)]
+    pub target_sol: SystemAccount<'info>,
+
+    #[account(mut, address = global_config.treasury)]
+    pub treasury: SystemAccount<'info>,
+
+    pub executor: Signer<'info>,
+
+    #[account(
+        seeds = [b"global-config"],
+        bump,
+    )]
+    pub global_config: Account<'info, GlobalConfig>,
+
+    pub refund_receiver: SystemAccount<'info>,
+}
+
+#[derive(Accounts)]
+pub struct ExecuteOrderSpl<'info> {
+    #[account(mut)]
+    pub order: Account<'info, DCAOrder>,
+
+    #[account(
+        mut,
+        constraint = order_token_account.owner == order.key()
+    )]
+    pub order_token_account: Account<'info, TokenAccount>,
+
+    #[account(mut)]
+    pub target_token_account: Account<'info, TokenAccount>,
+
+    #[account(
+        mut,
+        constraint = treasury_token_account.owner == global_config.treasury.key(),
+        constraint = treasury_token_account.mint == order.from_token,
+        constraint = treasury_token_account.key() == get_associated_token_address(&global_config.treasury.key(), &order.from_token)
+    )]
+    pub treasury_token_account: Account<'info, TokenAccount>,
+
+    #[account(
+        seeds = [b"global-config"],
+        bump,
+    )]
+    pub global_config: Account<'info, GlobalConfig>,
+
+    #[account(mut)]
+    pub refund_receiver: SystemAccount<'info>,
+
+    pub executor: Signer<'info>,
+
+    pub token_program: Program<'info, Token>,
 }
 
 #[account]
@@ -380,4 +797,6 @@ pub enum CustomError {
     InvalidRefundReceiver,
     #[msg("Only owner can execute.")]
     OnlyOwnerCanExecute,
+    #[msg("Need more than zero.")]
+    NeedsMoreThanZero,
 }

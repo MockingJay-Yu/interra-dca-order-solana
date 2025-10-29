@@ -335,3 +335,163 @@ describe("openOrder test", () => {
     );
   });
 });
+
+describe("cancelOrderSol test", () => {
+  const provider = anchor.AnchorProvider.local();
+  anchor.setProvider(provider);
+
+  const program = anchor.workspace.interraDcaOrderSolana as anchor.Program;
+  const user = provider.wallet.publicKey;
+
+  let globalConfigPda: PublicKey;
+  [globalConfigPda] = PublicKey.findProgramAddressSync(
+    [Buffer.from("global-config")],
+    program.programId
+  );
+
+  it("should cancel an existing SOL dca order", async () => {
+    const amountIn = new anchor.BN(1_000_000);
+
+    // 1. 创建一个SOL订单
+    const [orderPda, openOrderParams, bump] = await createSolOrder(
+      program,
+      user,
+      amountIn,
+      globalConfigPda
+    );
+
+    // 2. 添加事件监听器，监听 OrderCancelled 事件
+    const listener = await program.addEventListener(
+      "OrderCancelled",
+      (event: any, slot) => {
+        try {
+          expect(event.orderPubkey.toBase58()).to.equal(orderPda.toBase58());
+          expect(event.canceller.toBase58()).to.equal(user.toBase58());
+        } catch (e) {
+          console.error("Event assertion failed:", e);
+          throw e;
+        }
+      }
+    );
+
+    // 取消后余额
+    const refundReceiverBefore = await provider.connection.getBalance(user);
+
+    // 3. 调用 cancelOrderSol 方法取消订单
+    await program.methods
+      .cancelOrderSol()
+      .accounts({
+        order: orderPda,
+        user,
+        refundReceiver: user,
+        globalConfig: globalConfigPda,
+        systemProgram: SystemProgram.programId,
+      })
+      .rpc();
+
+    // 4. 等待事件处理
+    await new Promise((resolve) => setTimeout(resolve, 500));
+    await program.removeEventListener(listener);
+
+    // 5.取消后余额
+    const refundReceiverAfter = await provider.connection.getBalance(user);
+    expect(refundReceiverAfter).to.be.greaterThan(refundReceiverBefore);
+
+    const closedOrderInfo = await provider.connection.getAccountInfo(orderPda);
+    expect(closedOrderInfo).to.be.null;
+  });
+
+  it("should cancel an existing SPL dca order", async () => {
+    // 1. 创建一个测试 SPL Token mint
+    const mint = await createMint(
+      provider.connection,
+      provider.wallet.payer,
+      user,
+      null,
+      6 // decimals
+    );
+
+    // 2. 获取用户的 ATA
+    const userTokenAccount = await getOrCreateAssociatedTokenAccount(
+      provider.connection,
+      provider.wallet.payer,
+      mint,
+      user
+    );
+
+    // 3. 给用户 mint 一些测试 token
+    await mintTo(
+      provider.connection,
+      provider.wallet.payer,
+      mint,
+      userTokenAccount.address,
+      user,
+      1000_000_000
+    );
+
+    // 5. 创建spl订单
+    const amount = new anchor.BN(1_000_000);
+
+    const [orderPda, orderTokenAccount, openOrderParams, bump] =
+      await createSplOrder(
+        program,
+        provider,
+        user,
+        mint,
+        amount,
+        globalConfigPda
+      );
+
+    // 取消前用户token账户余额
+    const userTokenAccountBefore = await getAccount(
+      provider.connection,
+      userTokenAccount.address
+    );
+
+    // 事件监听器
+    const listener = await program.addEventListener(
+      "OrderCancelled",
+      (event: any) => {
+        expect(event.orderPubkey.toBase58()).to.equal(orderPda.toBase58());
+        expect(event.by.toBase58()).to.equal(user.toBase58());
+      }
+    );
+
+    await program.methods
+      .cancelOrderSpl()
+      .accounts({
+        order: orderPda,
+        user: user,
+        userTokenAccount: userTokenAccount.address,
+        orderTokenAccount: orderTokenAccount,
+        refundReceiver: user,
+        globalConfig: globalConfigPda,
+        tokenProgram: TOKEN_PROGRAM_ID,
+      })
+      .rpc();
+
+    await new Promise((r) => setTimeout(r, 500));
+    await program.removeEventListener(listener);
+
+    // 取消后用户token账户余额
+    const userTokenAccountAfter = await getAccount(
+      provider.connection,
+      userTokenAccount.address
+    );
+
+    // 断言用户token账户余额增加了（因为退回了）
+    expect(Number(userTokenAccountAfter.amount)).to.be.greaterThan(
+      Number(userTokenAccountBefore.amount)
+    );
+
+    // 校验 order 账户已关闭
+    const closedOrderInfo = await provider.connection.getAccountInfo(orderPda);
+    expect(closedOrderInfo).to.be.null;
+
+    // 校验 order_token_account 账户已关闭
+    const closedTokenInfo = await provider.connection.getAccountInfo(
+      orderTokenAccount
+    );
+    expect(closedTokenInfo).to.be.null;
+  });
+});
